@@ -1,61 +1,136 @@
-# shellcheck shell=bash
 # scripts/smoke.sh 的一项一项探测，跟着插件走。没写的项会 FAIL 并给出写法，不会默认放行。
 #
 # 变量别叫 state：shellcheck 把这份文件连着 probes.sh 一起分析，probes.sh 自己也读一个 dev.sh 提供的 state；
 # 子壳体函数（fn() ( … )）里给 state 赋值，SC2031 就报在 probes.sh 上，CI 红。
 #
-# 变量：SMOKE_WEB_URL 是应用的网页入口（套件已去尾斜杠，但可能带路径，比如 SSO 登录页）；
-#       拼 API 路径用 SMOKE_WEB_ORIGIN（只有 scheme://host:port，入口的路径不掺进来），别直接接在 SMOKE_WEB_URL 后面。
-#
+# 变量：两套冒烟环境（dev.sh smoke、正式 e2e 套件）都给的只有 SMOKE_STATE、SMOKE_JAR、SMOKE_WEB_URL、
+#       SMOKE_OWNER、SMOKE_BASE、SMOKE_TOKEN、SMOKE_INSTANCE 和 web_get、dweb。SMOKE_WEB_URL 的含义两边不同
+#       （dev.sh smoke 是带路径的网页入口，正式套件剥成只有 origin），拼 API 一律用 _gw_origin 现场取 origin，
+#       不依赖 SMOKE_WEB_ORIGIN/SMOKE_PLUGIN_ID（正式套件的钩子约定里没有这两个）。
 # 页面：web_assert 从标准输入读页面，命中的确是应用的真实页面时返回 0。
-# 身份：identity_check 只证明身份：用应用自己的“当前用户”接口断言认出的是用户管理员，不碰应用里的数据。
-#       数据断言（是否配置过、有几条、内容对不对）全部交给 data_write / data_check：冒烟第 1 项会先装升级
-#       起点写数据，身份探针再断言“数据目录是空的”就会红。接口回字段时也只看类型（如 configured 是布尔、
-#       nodes 是数字），值和条数留给 data_check。
-#       没有用户体系时写 IDENTITY_NA=1，并在 SMOKE_NOTE 里写原因。dweb / web_get 是带用户会话的请求助手，可继续走应用自己的登录链。
-#       SSO 登录跳转不用自己写表单逻辑：dweb --sso 会从清单 webui.path 的入口出发（没写就是 /），提交核心
-#       登录页的 JS 自动表单并跟完重定向，返回的页面已带应用的登录态。
-# 工具：MCP_TOOL 写一个只读工具名（可带插件前缀），MCP_ARGS 是 JSON 参数；mcp_assert 从标准输入读调用结果。
-#       要断言多个工具时改成写 mcp_check；调用前要备数据时写 before_mcp。
-# 通知房间：申请了 notify 的插件把通知交给核心，核心以核心账号发进和主人的“Wonton”私聊。
-#       探针以主人身份读这个房间：probes_owner_room_wait <超时秒> <要找的文字> 等到开始之后发来的、包含这段文字的
-#       消息就返回 0，超时列出看到的最新消息并返回非 0。要先把等待挂到后台再发通知，否则消息可能在等待开始前就到：
-#         room_wait() {
-#           local marker="probe-$RANDOM" url
-#           url="$(docker exec "wonton-$SMOKE_INSTANCE--${SMOKE_PLUGIN_ID//./-}--web" printenv WONTON_NOTIFY_URL)"
-#           probes_owner_room_wait 120 "$marker" & local pid=$!
-#           docker exec "wonton-$SMOKE_INSTANCE--${SMOKE_PLUGIN_ID//./-}--web" wget -q -O /dev/null \
-#             --header 'Content-Type: application/json' --post-data "{\"title\":\"$marker\"}" "$url"
-#           wait "$pid"
-#         }
-#       上面的 web 换成插件里能发 HTTP 的服务；wget 换成那个服务里有的客户端。
-# 数据：合并前要验证“升级/重装不丢用户数据”时写 data_write 和 data_check（两个都写才跑）：data_write 用随机标记写
-#       一条数据并把标记原样存进 $SMOKE_STATE，data_check 读回标记去应用里找，对不上就打印看到了什么并返回非 0。
-#       应用不存用户数据时写 DATA_NA=1（两项记 N/A）。
-# 装之前要准备（如先配出口代理）：写 before_install。
+# 身份：identity_check 用应用自己的"当前用户"接口断言认出的是用户管理员，不碰应用里的数据。
+# 数据：data_write / data_check 写一条带随机标记的数据、重装后读回。
+# 没有 MCP（上游没有，规范也不让自造），不设 MCP_TOOL。
+#
+# Gramps 的 API 认的是 Bearer JWT（前端存 localStorage，不走 Cookie），所以这里自己走一遍
+# OIDC 换令牌，再带 Bearer 调应用接口；核心会话 Cookie（SMOKE_JAR）仍然全程带着——Hydra
+# authorize 靠它认出主人。
+# /api/oidc/login/ 和 callback 有限速（5 次/分钟），同一个 shell 里缓存令牌，别反复走登录链。
+# shellcheck shell=bash disable=SC2034  # SSO/MCP 由冒烟套件读取
+SSO=oidc
+MCP=0
 
-web_assert() { grep -q '你好'; }   # 示例页的标题
+GW_SLUG=org-gramps-project-grampsweb   # 清单 id 里的点换成 -，网页地址的主机名第一段
 
-identity_check() { # 页面回显的就是网关注入的用户名；示例页不存数据，也不拿数据判断身份
-  local page
-  page="$(dweb /)" || { echo "页面失败：$page"; return 1; }
-  grep -qF "你好，$SMOKE_OWNER" <<<"$page" || { echo "页面没回显用户 $SMOKE_OWNER：$(head -c 120 <<<"$page")"; return 1; }
+_gw_origin() { # web_url 可能带路径，拼 API 前取 origin；单跑数据探针时没有 SMOKE_WEB_URL，
+               # 按固定 slug 和核心地址推（插件网页是 <slug>.<实例域名>）。
+  local url="${SMOKE_WEB_URL:-}"
+  if [[ -z "$url" ]]; then
+    [[ -n "${SMOKE_BASE:-}" ]] || { echo "缺 SMOKE_BASE" >&2; return 1; }
+    url="http://${GW_SLUG}.${SMOKE_BASE#http://}"
+  fi
+  local u="${url%%\?*}" rest="${url#*://}"
+  printf '%s://%s' "${u%%://*}" "${rest%%/*}"
 }
 
-# 数据：合并前要验证“升级/重装不丢用户数据”时写 data_write 和 data_check（两个都写才跑）：
-#   data_write 用随机标记写一条数据，把标记原样覆盖写进 $SMOKE_STATE（一个已建好的空文件，不是目录）；data_check 读回标记、去应用里找，
-#   找不到就打印看到了什么并返回非 0。
-# 应用不存用户数据时写 DATA_NA=1（两项记 N/A）。模板的示例页不存数据，所以这里是不适用。
-# 数据要写进插件容器时（Agent 插件的工作区标记等），容器名别自己拼：钩子契约里没有 SMOKE_SLUG，e2e 套件的
-# data_write 又跑在实例名导出之前，拼出来的名字缺段（No such container）；Bot 服务（清单声明了 bots）每个 Bot
-# 一组容器，名字还带 --<Bot 名> 后缀。按核心打的标签找，插件自带 smoke 和 e2e 套件两个运行环境都成立
-# （实例名没导出时按 SMOKE_BASE 的主机名第一段推）：
-#   _container() { # <插件 id> <服务名>：本实例里这个服务的容器
-#     local inst="${SMOKE_INSTANCE:-}" args=(--filter "label=wonton.plugin=$1" --filter "label=wonton.service=$2")
-#     if [[ -z "$inst" && -n "${SMOKE_BASE:-}" ]]; then
-#       inst="${SMOKE_BASE#http://}"; inst="${inst%%.*}"
-#     fi
-#     [[ -z "$inst" ]] || args+=(--filter "label=wonton.instance=${inst//-/}")
-#     docker ps --format '{{.Names}}' "${args[@]}" | head -1
-#   }
-export DATA_NA=1
+_gw_state_file() { # SMOKE_STATE 在 e2e 里是标记文件本身，不是目录
+  if [[ -d "$SMOKE_STATE" ]]; then printf '%s' "$SMOKE_STATE/gramps-marker"; else printf '%s' "${SMOKE_STATE}.marker"; fi
+}
+
+# 走完整 OIDC：核心会话 → 应用 /api/oidc/login/?provider=custom → Hydra authorize → 应用
+# /api/oidc/callback/custom（302 到 /oidc/complete#code=…）→ POST /api/oidc/tokens/ 换 JWT。
+# 打到标准输出（诊断走标准错误）。provider 名和回调路径来自清单（provider 固定 custom，上游源码）。
+gw_token() {
+  local jar base_core origin loc url callback done_url code body hops
+  jar="${SMOKE_JAR:-}"
+  base_core="${SMOKE_BASE:-}"
+  origin="$(_gw_origin)" || return 1
+  [[ -n "$jar" && -n "$base_core" && -n "${SMOKE_TOKEN:-}" ]] ||
+    { echo "缺冒烟变量：需要 SMOKE_JAR/SMOKE_BASE/SMOKE_TOKEN" >&2; return 1; }
+  # 核心会话补进 jar（-b 保留别的域的 Cookie，只写 -c 会抹掉）。
+  curl -sS --noproxy '*' -o /dev/null -b "$jar" -c "$jar" --data-urlencode "token=${SMOKE_TOKEN}" \
+    "$base_core/_wonton/login" ||
+    { echo "主人令牌登录不了核心" >&2; return 1; }
+  # 应用起跳：302 到身份提供方的 authorize 地址（顺带拿到应用的 OIDC 会话 Cookie）。
+  loc="$(curl -sS --noproxy '*' -o /dev/null -w '%{redirect_url}' -b "$jar" -c "$jar" \
+    "$origin/api/oidc/login/?provider=custom")" ||
+    { echo "起跳失败：/api/oidc/login/" >&2; return 1; }
+  [[ "$loc" == http* ]] || { echo "起跳没给 authorize 地址：$loc" >&2; return 1; }
+  # authorize 链不止一跳：/oauth2/auth → 核心登录页（/_wonton/oidc/login?login_challenge=…）
+  # → 带 login_verifier 回 /oauth2/auth → 可能还有同意页 → 应用回调。逐跳跟着走，
+  # 直到 Location 落在应用回调上；核心会话 Cookie 全程有效，不用提交表单。
+  local url="$loc" callback="" hops=0
+  while (( hops < 8 )); do
+    callback="$(curl -sS --noproxy '*' -o /dev/null -w '%{redirect_url}' -b "$jar" -c "$jar" "$url")" ||
+      { echo "authorize 链请求失败：$url" >&2; return 1; }
+    if [[ "$callback" == *"/api/oidc/callback/custom"* ]]; then break; fi
+    if [[ "$callback" != http* ]]; then
+      echo "authorize 链断了（第 $((hops + 1)) 跳不是重定向）：$url" >&2
+      return 1
+    fi
+    url="$callback"
+    hops=$((hops + 1))
+  done
+  [[ -n "$callback" && "$callback" == *"/api/oidc/callback/custom"* ]] ||
+    { echo "authorize 没走到应用回调，停在：$url" >&2; return 1; }
+  # 回调再 302 到前端 /oidc/complete#code=…：别跟（跟过去是 SPA，fragment 不好拿），直接读 Location。
+  done_url="$(curl -sS --noproxy '*' -o /dev/null -w '%{redirect_url}' -b "$jar" -c "$jar" "$callback")" ||
+    { echo "回调失败：$callback" >&2; return 1; }
+  code="${done_url##*#code=}"
+  [[ -n "$code" && "$code" != "$done_url" ]] || { echo "回调没带 code：$done_url" >&2; return 1; }
+  body="$(curl -sS --noproxy '*' --fail-with-body -b "$jar" -H 'Content-Type: application/json' \
+    -d "{\"code\":\"$code\"}" "$origin/api/oidc/tokens/")" ||
+    { echo "换令牌失败：$body" >&2; return 1; }
+  jq -r '.access_token // empty' <<<"$body"
+}
+
+gw_token_cached() {
+  if [[ -z "${GW_TOKEN:-}" ]]; then GW_TOKEN="$(gw_token)" || return 1; fi
+  printf '%s' "$GW_TOKEN"
+}
+
+web_assert() { grep -q '<gramps-js>'; }   # 上游 SPA 的宿主元素，别的页面不会有
+
+identity_check() {
+  local token me
+  token="$(gw_token_cached)" || return 1
+  me="$(curl -sS --noproxy '*' --fail-with-body -b "${SMOKE_JAR:-}" -H "Authorization: Bearer $token" \
+    "$(_gw_origin)/api/users/-/")" ||
+    { echo "当前用户接口失败：$me"; return 1; }
+  jq -e --arg u "$SMOKE_OWNER" '.name == $u' <<<"$me" >/dev/null ||
+    { echo "当前用户不是用户 $SMOKE_OWNER：$(head -c 200 <<<"$me")"; return 1; }
+  # 主人在 groups 声明里带 owner，映射到 Gramps Admin（角色值 5）；映射没生效会直接 401。
+  jq -e '.role == 5' <<<"$me" >/dev/null ||
+    { echo "主人不是 Admin（角色映射没生效？）：$(jq -c '{name,role}' <<<"$me")"; return 1; }
+}
+
+# 保数据：带标记的 Note 走 POST /api/objects/（对象形状按上游测试夹具：
+# text 是 {_class: StyledText, string: …}），标记和 handle 写进 $SMOKE_STATE；
+# 升级/重装后 GET /api/notes/<handle> 读回核对。
+data_write() {
+  local token marker handle out origin
+  origin="$(_gw_origin)" || { echo "推不出应用地址" >&2; return 1; }
+  [[ -n "${SMOKE_JAR:-}" ]] ||
+    { echo "缺冒烟变量：需要 SMOKE_JAR" >&2; return 1; }
+  token="$(gw_token_cached)" || { echo "拿不到应用令牌，写不了数据" >&2; return 1; }
+  marker="保数据-$(od -An -N6 -tx1 /dev/urandom | tr -d ' \n')"
+  handle="$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
+  out="$(curl -sS --noproxy '*' --fail-with-body -b "${SMOKE_JAR:-}" -X POST \
+    -H "Authorization: Bearer $token" -H 'Content-Type: application/json' \
+    -d "[{\"_class\":\"Note\",\"handle\":\"$handle\",\"text\":{\"_class\":\"StyledText\",\"string\":\"$marker\"}}]" \
+    "$origin/api/objects/")" || { echo "建备注失败：$out"; return 1; }
+  jq -nc --arg m "$marker" --arg h "$handle" '{marker:$m,handle:$h}' >"$( _gw_state_file )"
+}
+
+data_check() {
+  local token marker handle seen origin
+  origin="$(_gw_origin)" || { echo "推不出应用地址" >&2; return 1; }
+  marker="$(jq -r .marker "$( _gw_state_file )")"
+  handle="$(jq -r .handle "$( _gw_state_file )")"
+  token="$(gw_token_cached)" || { echo "拿不到应用令牌，查不了数据" >&2; return 1; }
+  seen="$(curl -sS --noproxy '*' --fail-with-body -b "${SMOKE_JAR:-}" -H "Authorization: Bearer $token" \
+    "$origin/api/notes/$handle")" ||
+    { echo "备注 $handle 读不到（数据丢了？）：$seen"; return 1; }
+  jq -e --arg m "$marker" '.text.string == $m' <<<"$seen" >/dev/null ||
+    { echo "备注对不上：期待 $marker，看到 $(jq -c '{gramps_id,text}' <<<"$seen" 2>/dev/null || head -c 200 <<<"$seen")"; return 1; }
+}
